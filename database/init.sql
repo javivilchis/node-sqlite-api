@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     text TEXT NOT NULL,
+    description TEXT NOT NULL,
+    temperature TEXT NOT NULL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     last_viewed_at TEXT,
     last_viewed_by INTEGER,
