@@ -1,10 +1,12 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { readFile } from "fs/promises";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import path from "path";
 
 dotenv.config();
 const PORT = process.env.PORT || 4000;
@@ -22,12 +24,17 @@ let db;
 
 // ✅ Open DB first, then register routes and start server
 (async () => {
+  const initPath = path.resolve("./database/init.sql");
+
   db = await open({
     filename: "./database/data.db",
     driver: sqlite3.Database,
   });
   console.log("✅ SQLite database connected");
 
+  const initSQL = await readFile(initPath, "utf8");
+  await db.exec(initSQL);
+  console.log("✅ Schema initialized");
   // ---------- AUTH MIDDLEWARE ----------
   function authMiddleware(requiredRoles = []) {
     return (req, res, next) => {
@@ -187,18 +194,111 @@ let db;
       }
     }
   );
+  app.get(
+    "/api/entries/:id",
+    authMiddleware(["admin", "super_admin", "user"]),
+    async (req, res) => {
+      const { id } = req.params;
+      try {
+        const entry = await db.get(
+          `SELECT e.*, u.username AS author_name
+             FROM entries e
+             JOIN users u ON e.user_id = u.id
+            WHERE e.id = ?`,
+          [id]
+        );
+        if (!entry) return res.status(404).json({ error: "Entry not found" });
 
+        // Update last_viewed_at and last_viewed_by
+        await db.run(
+          "UPDATE entries SET last_viewed_at = datetime('now'), last_viewed_by = ? WHERE id = ?",
+          [req.user.id, id]
+        );
+
+        res.json(entry);
+      } catch {
+        res.status(500).json({ error: "Fetch failed" });
+      }
+    }
+  );
   app.put(
     "/api/entries/:id",
+    authMiddleware(["admin", "super_admin", "user"]),
+    async (req, res) => {
+      const { id } = req.params;
+      const { text, description, temperature } = req.body;
+      const editorId = req.user.id;
+
+      try {
+        // 1️⃣ Get current entry before update
+        const current = await db.get("SELECT * FROM entries WHERE id = ?", [
+          id,
+        ]);
+        if (!current) return res.status(404).json({ error: "Entry not found" });
+
+        // 2️⃣ Save current snapshot to entry_history
+        await db.run(
+          `INSERT INTO entry_history
+          (entry_id, text, description, temperature, edited_by)
+         VALUES (?, ?, ?, ?, ?)`,
+          [
+            current.id,
+            current.text,
+            current.description,
+            current.temperature,
+            editorId,
+          ]
+        );
+
+        // 3️⃣ Update main entry
+        await db.run(
+          `UPDATE entries
+           SET text = ?,
+               description = ?,
+               temperature = ?,
+               last_edited_by = ?,
+               last_edited_at = datetime('now')
+         WHERE id = ?`,
+          [text, description, temperature, editorId, id]
+        );
+
+        // 4️⃣ Return updated entry
+        const updated = await db.get(
+          `SELECT e.*, u.username AS author_name,
+                e2.username AS last_editor_name
+           FROM entries e
+           JOIN users u ON e.user_id = u.id
+           LEFT JOIN users e2 ON e.last_edited_by = e2.id
+          WHERE e.id = ?`,
+          [id]
+        );
+
+        res.json(updated);
+      } catch (err) {
+        console.error("Update with history error:", err);
+        res.status(500).json({ error: "Database update failed" });
+      }
+    }
+  );
+  // --- get history for an entry ---
+  app.get(
+    "/api/entries/:id/history",
     authMiddleware(["admin", "super_admin"]),
     async (req, res) => {
       const { id } = req.params;
-      const { text } = req.body;
       try {
-        await db.run("UPDATE entries SET text = ? WHERE id = ?", [text, id]);
-        res.json({ id, text });
-      } catch {
-        res.status(500).json({ error: "Update failed" });
+        const history = await db.all(
+          `SELECT h.*, u.username AS edited_by_name
+           FROM entry_history h
+           LEFT JOIN users u ON h.edited_by = u.id
+          WHERE h.entry_id = ?
+          ORDER BY h.edited_at DESC`,
+          [id]
+        );
+        res.json(history);
+      } catch (err) {
+        console.error("History query error:", err);
+        res.status(500).json({ error: "Failed to load history" });
       }
     }
   );
